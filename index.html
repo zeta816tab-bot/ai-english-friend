@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI 영어 친구</title>
+<!-- 홈 화면 설치(PWA)와 APK 생성 도구가 읽는 정보 -->
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<meta name="theme-color" content="#f59e0b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  /* 색은 변수로 모아 두어 밝은/어두운 화면에서 같이 바뀌게 했어요 */
+  :root { --bg:#fffaf0; --fg:#222; --card:#fff; --en:#1d4ed8; --quote:#15803d; --ko:#1e40af; --muted:#6b7280; --stop:#dc2626; --btn:#f59e0b; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#111827; --fg:#f3f4f6; --card:#1f2937; --en:#93c5fd; --quote:#86efac; --ko:#bfdbfe; --muted:#9ca3af; }
+  }
+  :root[data-theme="dark"] { --bg:#111827; --fg:#f3f4f6; --card:#1f2937; --en:#93c5fd; --quote:#86efac; --ko:#bfdbfe; --muted:#9ca3af; }
+
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; min-height:100vh; }
+  header { display:flex; justify-content:space-between; align-items:center; }
+  h1 { font-size:20px; margin:0; }
+  #timer { font-size:14px; color:var(--muted); }
+  #status { font-size:16px; color:var(--muted); min-height:1.5em; }
+  .card { background:var(--card); border-radius:16px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  #subs { flex:1; min-height:240px; max-height:52vh; overflow-y:auto; }
+  .line { margin:0 0 12px; font-size:19px; line-height:1.5; color:var(--en); }
+  .line .q { color:var(--quote); font-weight:700; }
+  .line .ko { display:block; color:var(--ko); font-size:16px; margin-top:4px; }
+  .line.tap { cursor:pointer; }
+  #codeBox { display:flex; flex-direction:column; gap:8px; }
+  #codeBox input { font-size:18px; padding:12px; border-radius:10px; border:1px solid var(--muted); }
+  .controls { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  button { font-size:18px; padding:16px; border:0; border-radius:14px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  #start { grid-column:1 / -1; background:var(--btn); color:#111; font-size:22px; padding:20px; }
+  #report { background:#e5e7eb; color:#111; }
+  #stop { background:var(--stop); color:#fff; }
+  #cont { grid-column:1 / -1; background:#22c55e; color:#06230f; }
+  .hidden { display:none !important; }
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#111827; color:#fff; padding:12px 18px; border-radius:12px; font-size:16px; opacity:0; transition:opacity .2s; pointer-events:none; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AI 영어 친구</h1>
+    <span id="timer">0분</span>
+  </header>
+
+  <!-- 처음 한 번만 가족 코드를 입력하는 칸 (페이지에 코드를 적어 두지 않아요) -->
+  <div id="codeBox" class="card hidden">
+    <label for="codeInput">가족 코드를 입력하세요</label>
+    <input id="codeInput" type="password" autocomplete="off">
+    <button id="codeSave">저장</button>
+  </div>
+
+  <div id="status">준비됐어요. 아래 버튼을 눌러 시작해요.</div>
+  <div class="card" id="subs" aria-live="polite"></div>
+
+  <div class="controls">
+    <button id="start">말하기 시작</button>
+    <button id="report" disabled>멈췄어요</button>
+    <button id="stop" disabled>끝내기</button>
+    <button id="cont" class="hidden">계속하기</button>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+// ===== 설정 (이 부분만 고쳐 쓰세요) =====
+const CONFIG = {
+  EXEC_URL: '여기에_Apps_Script_웹앱_주소를_붙여넣으세요',  // 부록 A-1 서버의 "배포 > 웹 앱" 주소
+  SESSION_MAX_MIN: 30,   // 1회 최대 분 (뼈대 기본값: 30분)
+  DAILY_MAX_MIN: 60,     // 하루 최대 분. 처음엔 30~60분을 권해요
+  LOG_URL: ''            // 선택: 신고 기록용 주소. 비워 두면 기록을 보내지 않아요
+};
+
+// ===== 화면 요소 =====
+const $ = id => document.getElementById(id);
+const el = { status: $('status'), timer: $('timer'), subs: $('subs'), start: $('start'),
+             report: $('report'), stop: $('stop'), cont: $('cont'), codeBox: $('codeBox'),
+             codeInput: $('codeInput'), codeSave: $('codeSave'), toast: $('toast') };
+
+// ===== 상태 값 =====
+let FAMILY_CODE = '';
+try { FAMILY_CODE = localStorage.getItem('aiEnglishCode') || ''; } catch (e) { /* 저장소를 못 쓰면 매번 입력 */ }
+let pc = null, dc = null, mic = null, waitTimer = null, tickTimer = null, hiddenTimer = null;
+let sessionStartMs = 0, aiSpeaking = false, childSpeaking = false, replyPending = false;
+let gotAudio = false, failStreak = 0, retryUsed = false;
+const heard = {};                 // 아이 말 구간 (item_id -> 시작·길이)
+const lines = {};                 // response_id -> 자막 줄 요소
+let lineSeq = 0;                  // 한국어 풀이 요청에 붙이는 줄 번호
+const lineById = {};              // 줄 번호 -> 자막 줄 요소
+const capQueue = [];              // 한국어 풀이 대기열 (한 번에 한 건)
+let capBusy = false, capTimer = null;
+
+// ===== 공통 도구 =====
+function setStatus(msg) { el.status.textContent = msg; }
+function toast(msg) {
+  el.toast.textContent = msg; el.toast.classList.add('show');
+  setTimeout(() => el.toast.classList.remove('show'), 2500);
+}
+function send(obj) { if (dc && dc.readyState === 'open') dc.send(JSON.stringify(obj)); }
+function micOn(on) { if (mic) mic.getAudioTracks().forEach(t => { t.enabled = on; }); }
+function setBusy(on) { el.start.disabled = on; el.report.disabled = !on; el.stop.disabled = !on; }
+function showCont(on) { el.cont.classList.toggle('hidden', !on); }
+function scrollSubs() { el.subs.scrollTop = el.subs.scrollHeight; }
+function todayKey() { const d = new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+
+// 하루 사용 시간(초)을 기기 저장소에 기록해요. 저장이 안 되면 그냥 0으로 봐요.
+function loadUsage() {
+  try {
+    const u = JSON.parse(localStorage.getItem('aiEnglishUsage') || '{}');
+    return u.day === todayKey() ? u : { day: todayKey(), sec: 0 };
+  } catch (e) { return { day: todayKey(), sec: 0 }; }
+}
+function saveUsage(u) { try { localStorage.setItem('aiEnglishUsage', JSON.stringify(u)); } catch (e) { /* 무시 */ } }
+
+// ===== 가족 코드 입력 =====
+function showCodeBox() { el.codeBox.classList.remove('hidden'); el.codeInput.focus(); }
+el.codeSave.onclick = () => {
+  const c = el.codeInput.value.trim();
+  if (!c) return toast('코드를 입력해 주세요');
+  FAMILY_CODE = c;
+  try { localStorage.setItem('aiEnglishCode', c); } catch (e) { /* 저장 실패해도 이번 실행은 가능 */ }
+  el.codeBox.classList.add('hidden');
+  setStatus('준비됐어요. 아래 버튼을 눌러 시작해요.');
+};
+
+// ===== 자막 줄 만들기 =====
+// 큰따옴표 문장은 강조색으로 보여 줘요 (지시문의 신호와 같은 약속)
+function renderEn(lineEl, en) {
+  lineEl.textContent = '';
+  en.split(/(["“][^"”]*["”])/g).forEach(part => {
+    if (!part) return;
+    if (/^["“].*["”]$/.test(part)) {
+      const s = document.createElement('span'); s.className = 'q'; s.textContent = part; lineEl.appendChild(s);
+    } else {
+      lineEl.appendChild(document.createTextNode(part));
+    }
+  });
+}
+function getLine(rid) {
+  if (!lines[rid]) {
+    const p = document.createElement('p'); p.className = 'line';
+    p.dataset.en = ''; p.dataset.ko = '';
+    // 줄을 누르면 한국어 풀이를 요청해요 (풀이는 한 번만)
+    p.addEventListener('click', () => { if (!p.dataset.ko) enqueueKo(p); });
+    el.subs.appendChild(p); lines[rid] = p;
+  }
+  return lines[rid];
+}
+function appendEn(rid, delta) {
+  const p = getLine(rid); p.dataset.en += delta; renderEn(p, p.dataset.en); scrollSubs();
+}
+function finishEn(rid, transcript) {
+  const p = getLine(rid);
+  if (transcript) { p.dataset.en = transcript; renderEn(p, transcript); }
+  // 큰따옴표 문장이 있으면 줄 전체를 자동으로 풀이해요
+  if (/["“][^"”]*["”]/.test(p.dataset.en)) enqueueKo(p);
+}
+
+// ===== 한국어 풀이 (텍스트 전용 별도 요청, 대화 기록에 안 남아요) =====
+function enqueueKo(p) {
+  if (capQueue.includes(p)) return;
+  capQueue.push(p); pumpKo();
+}
+function pumpKo() {
+  // 아이 말 중이거나 AI 말 중이면 기다려요 (대화와 겹치지 않게)
+  if (capBusy || aiSpeaking || childSpeaking || capQueue.length === 0 || !pc) return;
+  const p = capQueue.shift();
+  if (!p.dataset.en) return pumpKo();
+  capBusy = true;
+  lineSeq += 1; lineById[lineSeq] = p;
+  send({ type: 'response.create', response: {
+    conversation: 'none', output_modalities: ['text'], max_output_tokens: 300, tools: [], tool_choice: 'none',
+    instructions: '다음 영어를 아이가 읽을 짧은 한국어 반말로만 번역해. 설명, 인사, 따옴표는 붙이지 마.',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: p.dataset.en }] }],
+    metadata: { kind: 'caption', line: String(lineSeq) } } });
+  // 응답이 15초 안에 안 오면 대기열을 풀어요
+  clearTimeout(capTimer); capTimer = setTimeout(() => { capBusy = false; pumpKo(); }, 15000);
+}
+function onCaptionDone(e) {
+  clearTimeout(capTimer); capBusy = false;
+  const id = e.response.metadata && e.response.metadata.line;
+  const p = lineById[id];
+  const text = (e.response.output || []).flatMap(o => o.content || [])
+    .filter(c => c.type === 'output_text').map(c => c.text).join('').trim();
+  if (p && text) {
+    p.dataset.ko = text;
+    const k = document.createElement('span'); k.className = 'ko'; k.textContent = text; p.appendChild(k);
+  }
+  pumpKo();
+}
+
+// ===== 시간 관리 =====
+function startTick() {
+  sessionStartMs = Date.now();
+  tickTimer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - sessionStartMs) / 1000);
+    el.timer.textContent = Math.floor(elapsed / 60) + '분';
+    const u = loadUsage(); u.sec += 1; saveUsage(u);
+    if (elapsed >= CONFIG.SESSION_MAX_MIN * 60) return endSession('오늘 수업은 여기까지 해요. 잘했어요!');
+    if (u.sec >= CONFIG.DAILY_MAX_MIN * 60) return endSession('오늘 시간을 다 썼어요. 내일 또 만나요!');
+  }, 1000);
+}
+
+// 화면을 45초 넘게 안 보면 수업을 끝내요 (앱만 믿으면 새요)
+document.addEventListener('visibilitychange', () => {
+  if (!pc) return;
+  if (document.hidden) hiddenTimer = setTimeout(() => endSession('화면을 떠나서 수업을 멈췄어요'), 45000);
+  else clearTimeout(hiddenTimer);
+});
+
+// ===== 대답 요청 (턴제: 아이 말이 끝나면 앱이 요청해요) =====
+function askReply() {
+  micOn(false);                       // AI가 말하는 동안 마이크를 닫아요
+  replyPending = true; gotAudio = false;
+  send({ type: 'response.create', response: { max_output_tokens: 700 } });
+  clearTimeout(waitTimer);
+  waitTimer = setTimeout(() => { showCont(true); setStatus('대답이 늦어요. 계속하기를 눌러 주세요.'); }, 30000);
+}
+
+// ===== 서버 호출 + WebRTC 연결 =====
+async function startTalk() {
+  if (pc) return;
+  if (CONFIG.EXEC_URL.includes('여기에')) return setStatus('서버 주소(EXEC_URL)를 설정해 주세요.');
+  if (!FAMILY_CODE) return showCodeBox();
+  const u = loadUsage();
+  if (u.sec >= CONFIG.DAILY_MAX_MIN * 60) return setStatus('오늘 시간을 다 썼어요. 내일 또 만나요.');
+
+  setBusy(true); setStatus('연결하는 중...');
+  try {
+    // 1) 서버에서 60초짜리 임시 키를 받아요 (진짜 API 키는 서버에만 있어요)
+    const r = await fetch(CONFIG.EXEC_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                                             body: JSON.stringify({ code: FAMILY_CODE }) });
+    let s = await r.json();
+    if (s.error) throw new Error(s.error);
+
+    // 2) 마이크 열기 (처음엔 닫아 둬요: 첫 인사가 끝날 때까지)
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    micOn(false);
+
+    // 3) 연결 만들기
+    pc = new RTCPeerConnection();
+    const audioEl = new Audio(); audioEl.autoplay = true;
+    pc.ontrack = e => { audioEl.srcObject = e.streams[0]; };
+    pc.onconnectionstatechange = () => {
+      if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) endSession('연결이 끊겼어요. 다시 시작해 주세요.');
+    };
+    mic.getTracks().forEach(t => pc.addTrack(t, mic));
+    dc = pc.createDataChannel('oai-events');
+    dc.onmessage = e => onEvent(JSON.parse(e.data));
+    dc.onopen = () => {
+      // AI가 먼저 인사해요
+      send({ type: 'conversation.item.create', item: { type: 'message', role: 'user',
+        content: [{ type: 'input_text', text: 'Say hi in one short sentence and ask one easy question.' }] } });
+      askReply();
+    };
+
+    await pc.setLocalDescription(await pc.createOffer());
+    const rtc = await fetch('https://api.openai.com/v1/realtime/calls', { method: 'POST', body: pc.localDescription.sdp,
+      headers: { Authorization: 'Bearer ' + s.value, 'Content-Type': 'application/sdp' } });
+    s = null;                          // 임시 키는 바로 지워요
+    if (!rtc.ok) throw new Error('RTC_HTTP_' + rtc.status);
+    await pc.setRemoteDescription({ type: 'answer', sdp: await rtc.text() });
+
+    setBusy(true); startTick();
+    setStatus('대화 중이에요. AI가 말하면 끝날 때까지 기다려 주세요.');
+  } catch (err) {
+    console.warn(err);
+    setStatus(friendlyError(err.message));
+    stopTalk(); setBusy(false);
+  }
+}
+function friendlyError(code) {
+  if (code === 'NO_ACCESS') return '가족 코드가 맞지 않아요. 다시 확인해 주세요.';
+  if (code === 'DAILY_LIMIT') return '오늘 연결 횟수를 다 썼어요. 내일 다시 해요.';
+  if (code && code.startsWith('OPENAI_402')) return '잔액이 부족해요. 부모님께 알려 주세요.';
+  return '연결하지 못했어요. 잠시 뒤 다시 해 보세요.';
+}
+
+// ===== 서버 이벤트 처리 =====
+function onEvent(e) {
+  switch (e.type) {
+    case 'input_audio_buffer.speech_started':
+      childSpeaking = true; heard[e.item_id] = { start: e.audio_start_ms };
+      break;
+    case 'input_audio_buffer.speech_stopped':
+      childSpeaking = false;
+      if (heard[e.item_id]) heard[e.item_id].ms = e.audio_end_ms - heard[e.item_id].start;
+      pumpKo();
+      break;
+    case 'input_audio_buffer.committed': {   // 아이 말이 끝났어요. 받아쓰기는 기다리지 않아요
+      const h = heard[e.item_id];
+      if (h && h.ms >= 400) { retryUsed = false; askReply(); }   // 0.4초 미만 소리는 무시
+      break;
+    }
+    case 'output_audio_buffer.started':      // AI 소리 재생 시작
+      aiSpeaking = true; gotAudio = true; failStreak = 0; clearTimeout(waitTimer); showCont(false);
+      break;
+    case 'output_audio_buffer.stopped':      // AI 소리 재생 끝: 스피커 끝소리가 지나간 뒤 마이크를 열어요
+      aiSpeaking = false;
+      setTimeout(() => { if (pc && !aiSpeaking) { micOn(true); setStatus('말해 보세요!'); } }, 900);
+      pumpKo();
+      break;
+    case 'response.output_audio_transcript.delta':
+      appendEn(e.response_id, e.delta); break;
+    case 'response.output_audio_transcript.done':
+      finishEn(e.response_id, e.transcript); break;
+    case 'response.done':
+      if (e.response.metadata && e.response.metadata.kind === 'caption') { onCaptionDone(e); return; }
+      replyPending = false;
+      logUsage(e.response.usage, e.response.status);
+      if (e.response.status !== 'completed' && !gotAudio) {
+        // 소리 없이 실패했어요: 한 번만 자동으로 다시 요청하고, 세 번 연속 실패면 수업을 끝내요
+        failStreak += 1;
+        if (failStreak >= 3) return endSession('조금 있다가 이어서 해 보자!');
+        if (!retryUsed) { retryUsed = true; setTimeout(() => { if (pc) askReply(); }, 1500); }
+        else showCont(true);
+      }
+      break;
+    case 'error':
+      console.warn('realtime error', e.error && e.error.code, e.error && e.error.message);
+      break;
+  }
+}
+
+// 사용량은 콘솔에만 남겨요 (기록 시트는 뼈대 4장·A-5에서 따로 붙여요)
+let usageTotal = { input: 0, output: 0 };
+function logUsage(usage, status) {
+  if (!usage) return;
+  usageTotal.input += usage.input_tokens || 0; usageTotal.output += usage.output_tokens || 0;
+  console.log('usage', status, usage, 'total', usageTotal);
+}
+
+// ===== 끝내기 / 멈추기 =====
+function stopTalk() {
+  clearTimeout(waitTimer); clearTimeout(capTimer); clearInterval(tickTimer); clearTimeout(hiddenTimer);
+  if (dc) dc.close(); if (pc) pc.close();
+  if (mic) mic.getTracks().forEach(t => t.stop());
+  pc = null; dc = null; mic = null;
+  aiSpeaking = false; childSpeaking = false; replyPending = false;
+  capQueue.length = 0; capBusy = false;
+  showCont(false);
+}
+function endSession(msg) {
+  if (!pc && !dc) return;            // 이미 끝났으면 아무것도 안 해요
+  stopTalk(); setBusy(false);
+  setStatus(msg || '수업이 끝났어요.');
+}
+
+// "멈췄어요": 아이가 누르는 신고 버튼. 글자 입력 없이 버튼 하나만 써요.
+el.report.onclick = () => {
+  endSession('멈췄어요. 부모님께 알렸어요.');
+  toast('알겠어요. 쉬어요!');
+  if (CONFIG.LOG_URL) {
+    // 대화 글은 보내지 않고, 시각과 신고 사실만 보내요
+    fetch(CONFIG.LOG_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ type: 'report', at: new Date().toISOString() }) }).catch(() => {});
+  }
+};
+el.stop.onclick = () => endSession('수업을 끝냈어요. 잘했어요!');
+el.start.onclick = startTalk;             // 시작은 꼭 아이가 누르는 버튼 안에서 해요 (소리 재생 허용)
+el.cont.onclick = () => { showCont(false); retryUsed = false; if (pc) askReply(); };
+
+// 처음 열 때 가족 코드가 없으면 입력 칸을 보여 줘요
+if (!FAMILY_CODE) showCodeBox();
+
+// 서비스 워커 등록 (홈 화면 설치 조건). 실패해도 대화 기능에는 영향이 없어요.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(err => console.warn('sw', err));
+}
+</script>
+</body>
+</html>
